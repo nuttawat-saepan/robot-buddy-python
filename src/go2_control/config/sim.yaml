@@ -1,0 +1,4 @@
+mode: sim
+max_vx: 2.0
+max_vyaw: 2.0
+use_sdk: false

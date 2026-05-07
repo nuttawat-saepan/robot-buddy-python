@@ -1,0 +1,19 @@
+pc2scan:
+  ros__parameters:
+    target_frame: base_link
+    transform_tolerance: 0.01
+
+    min_height: -0.05
+    max_height: 0.01
+
+    angle_min: -1.57
+    angle_max: 1.57
+    angle_increment: 0.0058
+
+    scan_time: 0.0
+
+    range_min: 0.1
+    range_max: 25.0
+
+    use_inf: true
+    inf_epsilon: 1.0
