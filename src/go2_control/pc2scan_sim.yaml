@@ -1,0 +1,19 @@
+pc2scan_sim: # เปลี่ยนจาก pc2scan_sim เป็น pc2scan ให้ตรงกับชื่อใน Launch
+  ros__parameters:
+    target_frame: base_scan # เฟรมของเซนเซอร์
+    transform_tolerance: 0.01
+
+    min_height: 0.03 # หลบพื้น 15 ซม.
+    max_height: 0.1  # ครอบคลุมความสูงหุ่นยนต์
+
+    angle_min: -1.5708
+    angle_max: 1.5708
+    angle_increment: 0.0058
+
+    scan_time: 0.1
+
+    range_min: 0.35  # เพิ่มเพื่อไม่ให้เห็นขาหรือตัวหุ่นยนต์เอง
+    range_max: 10.0
+
+    use_inf: true
+    inf_epsilon: 1.0

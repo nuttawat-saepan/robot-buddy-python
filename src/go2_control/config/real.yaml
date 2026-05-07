@@ -1,0 +1,4 @@
+mode: real
+max_vx: 1.0
+max_vyaw: 1.0
+use_sdk: true
