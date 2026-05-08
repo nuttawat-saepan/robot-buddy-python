@@ -1,6 +1,11 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from rclpy.qos import ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy
+from rclpy.qos import HistoryPolicy
 from rclpy.action import ActionClient
+from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import Twist
 from geometry_msgs.msg import PoseStamped
@@ -13,6 +18,7 @@ import paho.mqtt.client as mqtt
 from cv_bridge import CvBridge
 import cv2
 import os
+import array
 import base64
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, CompressedImage, BatteryState
@@ -23,16 +29,25 @@ from sensor_msgs.msg import Imu
 class MultiGoal(Node):
     def __init__(self):
         super().__init__('multi_goal')
-
+        map_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
         # ===== NAV2 =====
         self.client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         # ===== STATE =====
         self.current_goal = None
+        self.current_goal_handle = None
         self.pending_goal = []
         self.busy = False
         self.in_spin_mode = False
         self.waiting_cancel = False
+        self.odom = None
+        self.imu = None
+        self.map = None
 
         # ===== CAPTURE =====
         self.capture_mode = False
@@ -94,6 +109,7 @@ class MultiGoal(Node):
 
         self.spin_running = False
         self.capture_mode = False
+        self.last_cmd_vel = None
 
         if self.sim_mode:
             self.get_logger().info('🧪 Simulation mode active: battery values will be simulated')
@@ -124,16 +140,29 @@ class MultiGoal(Node):
         self.status_pub = None
         self.progress_pub = None
 
-        self.odom_topic = "odom"
-        self.imu_topic = "imu"
-        self.map_topic = "map"
+        self.odom_topic = "/odom"
+        self.imu_topic = "/imu/data"
+        self.map_topic = "/map"
 
          # ===== SUB =====
         self.create_subscription(Odometry, self.odom_topic, self.odom_cb, 10)
         self.create_subscription(Imu, self.imu_topic, self.imu_cb, 10)
-        self.create_subscription(OccupancyGrid, self.map_topic  , self.map_cb, 10)
+        self.create_subscription(
+            OccupancyGrid,
+            self.map_topic,
+            self.map_cb,
+            map_qos
+        )
 
-        self.update_timer = self.create_timer(0.5, self.publish_data)
+        self.update_timer = self.create_timer(0.2, self.publish_data)
+
+        # map sync
+        self.map_publish_timer = self.create_timer(
+            10.0,
+            self.map_sync_loop
+        )
+
+        self.frontend_connected = False
 
         self.index = 0
         self.mission = None
@@ -236,15 +265,14 @@ class MultiGoal(Node):
                     self.paused = False
                     self.stop_requested = True
                     self.get_logger().warn("🛑 STOP")
+                    self.publish_status("CANCELLED", "Mission canceled by user")
                     if hasattr(self, "current_goal_handle") and self.current_goal_handle:
                         future = self.current_goal_handle.cancel_goal_async()
                         future.add_done_callback(lambda f: self.get_logger().info("🚫 cancel confirmed"))
                         self.cancel_waypoints()
-                        self.publish_status("CANCELLED", "Mission canceled by user")
                         self.stop_requested = False
                     else:
                         self.cancel_waypoints()
-                        self.publish_status("CANCELLED", "Mission canceled by user")
                         self.stop_requested = False
 
                     # self.pending_goal.clear()
@@ -308,15 +336,20 @@ class MultiGoal(Node):
             elif topic == "cmd_vel":
                 self.get_logger().info(f"🎮 Joy command received: {data}")
                 try:
+                     # ===== parse Twist JSON =====
+                    linear = data.get("linear", {})
+                    angular = data.get("angular", {})
+
                     # ===== parse joy =====
-                    vx = float(data.get("vx", 0.0))
-                    wz = float(data.get("wz", 0.0))
-                    vy = float(data.get("vy", 0.0))  # optional
+                    vx = float(linear.get("x", 0.0))
+                    vy = float(linear.get("y", 0.0))
+                    wz = float(angular.get("z", 0.0))
 
                     # ===== clamp =====
-                    vx = max(-0.5, min(0.5, vx))
+                    vx = max(-1.0, min(1.0, vx))
                     wz = max(-1.5, min(1.5, wz))
-                    vy = max(-0.3, min(0.3, vy))
+                    vy = max(-1.0, min(1.0, vy))
+                    self.get_logger().info(f"🎮 Parsed cmd_vel: vx={vx}, vy={vy}, wz={wz}")
 
                     # ===== publish =====
                     self.publish_cmd_vel(vx, wz, vy)
@@ -335,58 +368,158 @@ class MultiGoal(Node):
 
     def map_cb(self, msg):
         self.map = msg
-    
+        self.get_logger().info(
+            f"🗺 Map received: {msg.info.width}x{msg.info.height}"
+        )
+
+    def publish_full_map(self):
+
+        if self.map is None:
+            self.get_logger().info(
+                "map not recieved yet, cannot publish"
+            )
+            return
+
+        try:
+
+            # int8[] -> bytes
+            raw = array.array('b', self.map.data).tobytes()
+
+            # bytes -> base64 string
+            encoded = base64.b64encode(raw).decode('utf-8')
+
+            payload = {
+                "op": "publish",
+                "topic": "/map",
+
+                "msg": {
+                    "header": {
+                        "stamp": {
+                            "secs": int(self.map.header.stamp.sec),
+                            "nsecs": int(self.map.header.stamp.nanosec)
+                        },
+                        "frame_id": self.map.header.frame_id
+                    },
+
+                    "info": {
+                        "resolution": self.map.info.resolution,
+                        "width": self.map.info.width,
+                        "height": self.map.info.height,
+
+                        "origin": {
+                            "position": {
+                                "x": self.map.info.origin.position.x,
+                                "y": self.map.info.origin.position.y,
+                                "z": self.map.info.origin.position.z
+                            },
+
+                            "orientation": {
+                                "x": self.map.info.origin.orientation.x,
+                                "y": self.map.info.origin.orientation.y,
+                                "z": self.map.info.origin.orientation.z,
+                                "w": self.map.info.origin.orientation.w
+                            }
+                        }
+                    },
+
+                    "encoding": "base64-int8",
+
+                    "data": encoded
+                }
+            }
+
+            self.mqtt.publish(
+                "map",
+                json.dumps(payload)
+            )
+            self.last_map_publish = time.time()
+
+            self.get_logger().info(
+                f"🗺 compressed map sent "
+                f"({len(raw)} bytes raw)"
+            )
+
+        except Exception as e:
+            self.get_logger().error(
+                f"publish map failed: {e}"
+            )
+
+    def map_sync_loop(self):
+
+        if self.map is None:
+            return
+
+        self.publish_full_map()
+
     def publish_data(self):
         try:
-            data = {}
 
-            if self.odom:
-                data["odom"] = {
+            # ================= ODOM =================
+            if self.odom is not None:
+
+                odom_data = {
                     "px": self.odom.pose.pose.position.x,
                     "py": self.odom.pose.pose.position.y,
                     "pz": self.odom.pose.pose.position.z,
+
+                    "qx": self.odom.pose.pose.orientation.x,
+                    "qy": self.odom.pose.pose.orientation.y,
+                    "qz": self.odom.pose.pose.orientation.z,
+                    "qw": self.odom.pose.pose.orientation.w,
+
                     "vx": self.odom.twist.twist.linear.x,
+                    "vy": self.odom.twist.twist.linear.y,
+                    "vz": self.odom.twist.twist.linear.z,
+
+                    "wx": self.odom.twist.twist.angular.x,
+                    "wy": self.odom.twist.twist.angular.y,
                     "wz": self.odom.twist.twist.angular.z
                 }
 
-            if self.imu:
-                data["imu"] = {
+                self.mqtt.publish(
+                    "odom",
+                    json.dumps(odom_data),
+                    qos=0
+                )
+
+            # ================= IMU =================
+            if self.imu is not None:
+
+                imu_data = {
                     "ax": self.imu.linear_acceleration.x,
                     "ay": self.imu.linear_acceleration.y,
                     "az": self.imu.linear_acceleration.z,
+
                     "gx": self.imu.angular_velocity.x,
                     "gy": self.imu.angular_velocity.y,
-                    "gz": self.imu.angular_velocity.z
+                    "gz": self.imu.angular_velocity.z,
+
+                    "qx": self.imu.orientation.x,
+                    "qy": self.imu.orientation.y,
+                    "qz": self.imu.orientation.z,
+                    "qw": self.imu.orientation.w
                 }
 
-            if self.map:
-                # ⚠️ map ใหญ่มาก อย่าส่งทั้งก้อนถ้าไม่จำเป็น
-                data["map"] = {
-                    "width": self.map.info.width,
-                    "height": self.map.info.height,
-                    "resolution": self.map.info.resolution
-                }
-
-            if data:
-                self.mqtt.publish("robot/data", json.dumps(data))
+                self.mqtt.publish(
+                    "imu",
+                    json.dumps(imu_data),
+                    qos=0
+                )
 
         except Exception as e:
-            self.get_logger().error(f"MQTT error: {e}")
+            self.get_logger().error(
+                f"MQTT publish error: {e}"
+            )
 
     def publish_cmd_vel(self, vx, wz, vy=0.0):
         try:
-            # กันส่งซ้ำ (ลด spam)
-            key = (round(vx, 3), round(vy, 3), round(wz, 3))
-            if key == self.last_cmd_vel:
-                return
-            self.last_cmd_vel = key
+            self.get_logger().info(f"🎮 Parsed cmd_vel: vx={vx}, vy={vy}, wz={wz}")
+            twist = Twist()
+            twist.linear.x = vx
+            twist.linear.y = vy
+            twist.angular.z = wz
 
-            msg = Twist()
-            msg.linear.x = vx
-            msg.linear.y = vy
-            msg.angular.z = wz
-
-            self.cmd_vel_pub.publish(msg)
+            self.cmd_vel_pub.publish(twist)
 
         except Exception as e:
             self.get_logger().error(f"cmd_vel publish error: {e}")
@@ -464,6 +597,7 @@ class MultiGoal(Node):
 
     def publish_progress(self, message=""):
         try:
+            progress = self._mission_progress(message)
             self.get_logger().info(f"📡 progress_topic = {self.progress_topic}")
             self.get_logger().info(
                     f" current = {self.current_index + 1}"
@@ -472,16 +606,10 @@ class MultiGoal(Node):
                     f" total = {self.total_waypoints}"
                 )
             self.get_logger().info(
-                f" progress = {round(((self.current_index) / self.total_waypoints) * 100)}"
+                f" progress = {progress}"
             )
             if not self.progress_topic:
                 return
-
-            progress = 0
-            if self.total_waypoints > 0 and message != "Finish: progress = 100":
-                progress = round(((self.current_index ) / self.total_waypoints) * 100)
-            elif message == "Finish: progress = 100":
-                progress = 100
 
             payload = {
                 "runId": self.mission_run_id,
@@ -504,6 +632,15 @@ class MultiGoal(Node):
                 self.get_logger().warn("MQTT not connected, skip publish")
         except Exception as e:
             self.get_logger().error(f"Publish progress failed: {e}")
+
+    def _mission_progress(self, message=""):
+        if message == "Finish: progress = 100":
+            return 100
+        if self.total_waypoints <= 0:
+            return 0
+
+        completed = max(0, min(self.current_index + 1, self.total_waypoints))
+        return round((completed / self.total_waypoints) * 100)
 
     def publish_image(self, img_b64):
         if img_b64 is None:
@@ -652,7 +789,11 @@ class MultiGoal(Node):
 
     # ================= SEND GOAL =================
     def send_goal(self, goal):
-        self.client.wait_for_server()
+        if not self.client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Nav2 action server not available")
+            self.publish_status("FAILED", "Nav2 action server not available")
+            self.cancel_waypoints()
+            return
 
         x = float(goal["x"])
         y = float(goal["y"])
@@ -673,11 +814,18 @@ class MultiGoal(Node):
 
     # ================= GOAL =================
     def on_goal(self, future, goal):
-        self.current_goal_handle = future.result()
+        try:
+            self.current_goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Send goal failed: {e}")
+            self.publish_status("FAILED", "Failed to send goal")
+            self.cancel_waypoints()
+            return
 
-        if not self.current_goal_handle.accepted:
+        if self.current_goal_handle is None or not self.current_goal_handle.accepted:
             self.get_logger().warn("❌ rejected")
-            self.finish()
+            self.publish_status("FAILED", "Goal rejected")
+            self.cancel_waypoints()
             return
 
         self.current_goal_handle.get_result_async().add_done_callback(
@@ -686,7 +834,13 @@ class MultiGoal(Node):
 
     # ================= RESULT =================
     def on_result(self, future, goal):
-        status = future.result().status
+        try:
+            status = future.result().status
+        except Exception as e:
+            self.get_logger().error(f"Goal result failed: {e}")
+            self.publish_status("FAILED", "Goal result failed")
+            self.cancel_waypoints()
+            return
 
         goal = self.current_goal
 
@@ -699,7 +853,7 @@ class MultiGoal(Node):
         yaw = goal["yaw"]
         is_capture = goal["is_capture"]
 
-        if status == 4:
+        if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info("🎯 arrived")
             completed_waypoints = self.current_index + 1
             progress = round((completed_waypoints / self.total_waypoints) * 100) if self.total_waypoints > 0 else 0
@@ -719,7 +873,7 @@ class MultiGoal(Node):
             else:
                 self.finish()
                 
-        elif status == 5:
+        elif status == GoalStatus.STATUS_ABORTED:
             self.get_logger().warn(f"💥 ABORTED at goal: {self.current_goal}")
             # 💀 ถ้าเป็น pause ไม่ต้อง cancel เพราะจะ resume ต่อได้
             if self.paused:
@@ -731,7 +885,7 @@ class MultiGoal(Node):
             self.cancel_waypoints()
 
         # ❌ CANCELED (manual cancel / preempt)
-        elif status == 6:
+        elif status == GoalStatus.STATUS_CANCELED:
             self.get_logger().warn(f"⚠️ CANCELED at goal: {self.current_goal}")
             # 💀 ถ้าเป็น pause ไม่ต้อง cancel เพราะจะ resume ต่อได้
             if self.paused:
@@ -809,9 +963,14 @@ class MultiGoal(Node):
 
     # 📩 spin response
     def spin_response_callback(self, future):
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Spin goal failed: {e}")
+            self.cancel_waypoints()
+            return
 
-        if not goal_handle.accepted:
+        if goal_handle is None or not goal_handle.accepted:
             self.get_logger().warn("❌ Spin rejected")
             self.cancel_waypoints()
             return
@@ -847,7 +1006,10 @@ class MultiGoal(Node):
         cv2.imwrite(filename, frame)
 
         # encode image → base64
-        _, jpg = cv2.imencode('.jpg', frame)
+        ok, jpg = cv2.imencode('.jpg', frame)
+        if not ok:
+            self.get_logger().warn("JPEG encode failed")
+            return
         img_b64 = base64.b64encode(jpg.tobytes()).decode('utf-8')
 
         # build JSON
@@ -931,6 +1093,7 @@ class MultiGoal(Node):
         # 3. reset state
         self.busy = False
         self.current_goal = None
+        self.current_goal_handle = None
 
         # 4. stop spin/capture pipelines
         self.capture_mode = False
