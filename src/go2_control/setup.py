@@ -26,6 +26,8 @@ setup(
 
         ('share/' + package_name + '/urdf',
             ['urdf/robot.urdf']),
+        ('share/' + package_name + '/config',
+            glob.glob('config/*')),
         ('share/' + package_name + '/meshes',
             glob.glob('meshes/*')),
     ],
@@ -52,6 +54,7 @@ setup(
         'camera = go2_control.camera:main',
         'fake_robot = go2_control.fake_robot:main',
         'gazebo_convert = go2_control.gazebo_convert:main',
+        'april_localizer = go2_control.april_localizer:main',
         ],
     },
 )
