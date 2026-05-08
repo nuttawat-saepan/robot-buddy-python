@@ -431,6 +431,12 @@ class MultiGoal(Node):
         msg = String()
         msg.data = json.dumps(payload)
         self.localization_request_pub.publish(msg)
+        expected_tag = payload["localize"].get("expectedTagId")
+        self.get_logger().info(
+            "AprilTag localization requested: "
+            f"scan={payload['localize']['scan']}, "
+            f"expectedTagId={expected_tag if expected_tag is not None else 'any'}"
+        )
         self.publish_localization_event({
             "requestId": request_id,
             "source": source,
@@ -455,6 +461,16 @@ class MultiGoal(Node):
             return
 
         status = data.get("status")
+        tag_id = data.get("tagId")
+        if tag_id is None:
+            self.get_logger().info(
+                f"AprilTag localization status: {status} - {data.get('message', '')}"
+            )
+        else:
+            self.get_logger().info(
+                f"AprilTag localization status: {status}, detected tag ID={tag_id}"
+            )
+
         if status == "SUCCESS":
             context = self.localization_context
             self.localization_active = False

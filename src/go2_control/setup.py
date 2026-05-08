@@ -23,7 +23,8 @@ setup(
 
         ('share/' + package_name + '/launch',
             ['launch/mapping.launch.py']),
-
+        ('share/' + package_name + '/config',
+            glob.glob('config/*')),
         ('share/' + package_name + '/urdf',
             ['urdf/robot.urdf']),
         ('share/' + package_name + '/config',
