@@ -63,7 +63,7 @@ class CameraNode(Node):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             self.track.update_frame(frame)
-            print("FRAME RECEIVED")
+            # print("FRAME RECEIVED")
 
             # debug (ปิดได้ถ้าหน่วง)
             cv2.imshow("ROS Camera", frame)
