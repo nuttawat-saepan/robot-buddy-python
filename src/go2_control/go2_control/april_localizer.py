@@ -3,10 +3,13 @@ import math
 import time
 import uuid
 
+import cv2
+import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from rclpy.node import Node
 from rclpy.duration import Duration
+from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
@@ -30,6 +33,62 @@ def quaternion_to_yaw(q):
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def quaternion_to_matrix(q):
+    x = q.x
+    y = q.y
+    z = q.z
+    w = q.w
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.identity(3)
+    s = 2.0 / n
+    xx = x * x * s
+    yy = y * y * s
+    zz = z * z * s
+    xy = x * y * s
+    xz = x * z * s
+    yz = y * z * s
+    wx = w * x * s
+    wy = w * y * s
+    wz = w * z * s
+    return np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def yaw_from_matrix(matrix):
+    return math.atan2(matrix[1, 0], matrix[0, 0])
+
+
+def rpy_to_matrix(roll, pitch, yaw):
+    cr = math.cos(roll)
+    sr = math.sin(roll)
+    cp = math.cos(pitch)
+    sp = math.sin(pitch)
+    cy = math.cos(yaw)
+    sy = math.sin(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
+
+
+def make_transform(rotation, translation):
+    transform = np.identity(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = np.array(translation, dtype=np.float64)
+    return transform
 
 
 def invert_pose_2d(x, y, yaw):
@@ -61,6 +120,9 @@ class AprilLocalizer(Node):
         self.detections_topic = self.declare_parameter(
             "detections_topic", "/detections"
         ).value
+        self.camera_info_topic = self.declare_parameter(
+            "camera_info_topic", "/camera/camera_info"
+        ).value
         self.request_topic = self.declare_parameter(
             "request_topic", "/localization/request"
         ).value
@@ -85,12 +147,15 @@ class AprilLocalizer(Node):
         self.initial_pose_covariance = float(
             self.declare_parameter("initial_pose_covariance", 0.05).value
         )
+        self.tag_size = float(self.declare_parameter("tag_size", 0.16).value)
         self.tag_map_poses = self._load_tag_map_poses(
             self.declare_parameter("tag_map_poses", "{}").value
         )
 
         self.active_request = None
         self.accepted_poses = []
+        self.camera_matrix = None
+        self.dist_coeffs = None
         self.last_scan_switch = 0.0
         self.scan_direction = 1.0
 
@@ -99,6 +164,9 @@ class AprilLocalizer(Node):
 
         self.request_sub = self.create_subscription(
             String, self.request_topic, self.request_cb, 10
+        )
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, self.camera_info_topic, self.camera_info_cb, 10
         )
         if AprilTagDetectionArray is None:
             self.detection_sub = None
@@ -115,9 +183,14 @@ class AprilLocalizer(Node):
             PoseWithCovarianceStamped, "/initialpose", 10
         )
         self.status_pub = self.create_publisher(String, self.status_topic, 10)
+        self.create_subscription(String, "/localization/abort", self.abort_cb, 10)
         self.timer = self.create_timer(0.1, self.update)
 
         self.get_logger().info("AprilTag localizer ready")
+
+    def camera_info_cb(self, msg):
+        self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape((3, 3))
+        self.dist_coeffs = np.array(msg.d, dtype=np.float64)
 
     def _load_tag_map_poses(self, raw):
         try:
@@ -129,13 +202,30 @@ class AprilLocalizer(Node):
         poses = {}
         for tag_id, pose in data.items():
             try:
-                poses[int(tag_id)] = (
-                    float(pose.get("x", 0.0)),
-                    float(pose.get("y", 0.0)),
+                yaw = (
                     math.radians(float(pose.get("yawDegrees")))
                     if "yawDegrees" in pose
-                    else float(pose.get("yaw", 0.0)),
+                    else float(pose.get("yaw", 0.0))
                 )
+                roll = (
+                    math.radians(float(pose.get("rollDegrees")))
+                    if "rollDegrees" in pose
+                    else float(pose.get("roll", 0.0))
+                )
+                pitch = (
+                    math.radians(float(pose.get("pitchDegrees")))
+                    if "pitchDegrees" in pose
+                    else float(pose.get("pitch", 0.0))
+                )
+                poses[int(tag_id)] = {
+                    "x": float(pose.get("x", 0.0)),
+                    "y": float(pose.get("y", 0.0)),
+                    "z": float(pose.get("z", 0.0)),
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "is_3d": any(key in pose for key in ("z", "roll", "pitch", "rollDegrees", "pitchDegrees")),
+                }
             except Exception as e:
                 self.get_logger().warn(f"Skipping invalid tag pose {tag_id}: {e}")
         return poses
@@ -146,6 +236,14 @@ class AprilLocalizer(Node):
         except Exception as e:
             self._publish_status("FAILED", message=f"Invalid request JSON: {e}")
             return
+
+        if "tagPoses" in data and data["tagPoses"]:
+            self.tag_map_poses = self._load_tag_map_poses(data["tagPoses"])
+            self.get_logger().info(
+                f"Using tagPoses from request: {sorted(self.tag_map_poses.keys())}"
+            )
+        else:
+            self.reload_tag_map_poses()
 
         localize = data.get("localize", data)
         if not isinstance(localize, dict):
@@ -183,6 +281,13 @@ class AprilLocalizer(Node):
             extra={"scan": scan, "expectedTagId": self.active_request["expectedTagId"]},
         )
 
+    def reload_tag_map_poses(self):
+        raw = self.get_parameter("tag_map_poses").value
+        self.tag_map_poses = self._load_tag_map_poses(raw)
+        self.get_logger().info(
+            f"Loaded AprilTag map poses for IDs: {sorted(self.tag_map_poses.keys())}"
+        )
+
     def update(self):
         if self.active_request is None:
             return
@@ -218,6 +323,11 @@ class AprilLocalizer(Node):
             if robot_pose is None:
                 continue
 
+            # stop rotating as soon as first valid detection arrives
+            if self.active_request.get("scan") and len(self.accepted_poses) == 0:
+                self._stop_robot()
+                self.active_request["scan"] = False
+
             self.accepted_poses.append(robot_pose)
             if len(self.accepted_poses) >= self.min_detections:
                 self._succeed(tag_id)
@@ -234,41 +344,152 @@ class AprilLocalizer(Node):
             self.get_logger().warn(f"No map pose configured for AprilTag {tag_id}")
             return None
 
-        try:
-            tag_pose = detection.pose.pose.pose
-        except AttributeError:
-            try:
-                tag_pose = detection.pose.pose
-            except AttributeError:
-                self.get_logger().warn("Unsupported AprilTag detection pose shape")
-                return None
-
         camera_frame = header.frame_id or self.default_camera_frame
-        tag_in_camera = (
-            float(tag_pose.position.x),
-            float(tag_pose.position.y),
-            quaternion_to_yaw(tag_pose.orientation),
-        )
+        tag_in_camera = self._get_tag_pose_from_detection(detection)
+        if tag_in_camera is None:
+            return None
 
         try:
             tf = self.tf_buffer.lookup_transform(
-                camera_frame,
                 self.base_frame,
+                camera_frame,
                 rclpy.time.Time(),
                 timeout=Duration(seconds=0.2),
             )
-            base_in_camera = (
-                float(tf.transform.translation.x),
-                float(tf.transform.translation.y),
-                quaternion_to_yaw(tf.transform.rotation),
-            )
+            tag_in_base = self._transform_pose_to_base(tag_in_camera, tf)
         except Exception as e:
-            self.get_logger().warn(f"TF {camera_frame}->{self.base_frame} failed: {e}")
+            self.get_logger().warn(f"TF {self.base_frame}<-{camera_frame} failed: {e}")
             return None
 
-        tag_in_base = compose_pose_2d(invert_pose_2d(*base_in_camera), tag_in_camera)
+        map_pose = self.tag_map_poses[tag_id]
+        if isinstance(tag_in_base, dict) and map_pose.get("is_3d"):
+            return self._calculate_robot_pose_3d(map_pose, tag_in_base)
+
         base_in_tag = invert_pose_2d(*tag_in_base)
-        return compose_pose_2d(self.tag_map_poses[tag_id], base_in_tag)
+        tag_map_pose_2d = (map_pose["x"], map_pose["y"], map_pose["yaw"])
+        return compose_pose_2d(tag_map_pose_2d, base_in_tag)
+
+    def _get_tag_pose_from_detection(self, detection):
+        try:
+            tag_pose = detection.pose.pose.pose
+            return (
+                float(tag_pose.position.x),
+                float(tag_pose.position.y),
+                quaternion_to_yaw(tag_pose.orientation),
+            )
+        except AttributeError:
+            pass
+
+        try:
+            tag_pose = detection.pose.pose
+            return (
+                float(tag_pose.position.x),
+                float(tag_pose.position.y),
+                quaternion_to_yaw(tag_pose.orientation),
+            )
+        except AttributeError:
+            pass
+
+        return self._estimate_tag_pose_from_corners(detection)
+
+    def _estimate_tag_pose_from_corners(self, detection):
+        if self.camera_matrix is None:
+            self.get_logger().warn("No CameraInfo yet; cannot estimate AprilTag pose")
+            return None
+        if self.tag_size <= 0.0:
+            self.get_logger().warn("tag_size must be greater than 0")
+            return None
+
+        try:
+            image_points = np.array(
+                [[corner.x, corner.y] for corner in detection.corners],
+                dtype=np.float64,
+            )
+        except Exception as e:
+            self.get_logger().warn(f"AprilTag corners unavailable: {e}")
+            return None
+
+        if image_points.shape != (4, 2):
+            self.get_logger().warn("AprilTag detection must contain 4 corners")
+            return None
+
+        half = self.tag_size / 2.0
+        object_points = np.array(
+            [
+                [-half, half, 0.0],
+                [half, half, 0.0],
+                [half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float64,
+        )
+
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points,
+            self.camera_matrix,
+            self.dist_coeffs,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
+        )
+        if not ok:
+            self.get_logger().warn("solvePnP failed for AprilTag detection")
+            return None
+
+        rotation, _ = cv2.Rodrigues(rvec)
+        return {
+            "translation": tvec.reshape(3),
+            "rotation": rotation,
+        }
+
+    def _transform_pose_to_base(self, tag_in_camera, camera_to_base_tf):
+        tf_rotation = quaternion_to_matrix(camera_to_base_tf.transform.rotation)
+        tf_translation = np.array(
+            [
+                camera_to_base_tf.transform.translation.x,
+                camera_to_base_tf.transform.translation.y,
+                camera_to_base_tf.transform.translation.z,
+            ],
+            dtype=np.float64,
+        )
+
+        if isinstance(tag_in_camera, dict):
+            tag_translation_base = (
+                tf_rotation @ tag_in_camera["translation"] + tf_translation
+            )
+            tag_rotation_base = tf_rotation @ tag_in_camera["rotation"]
+            return {
+                "translation": tag_translation_base,
+                "rotation": tag_rotation_base,
+            }
+
+        tag_x, tag_y, tag_yaw = tag_in_camera
+        tag_translation_base = tf_rotation @ np.array([tag_x, tag_y, 0.0]) + tf_translation
+        base_yaw_camera = quaternion_to_yaw(camera_to_base_tf.transform.rotation)
+        return (
+            float(tag_translation_base[0]),
+            float(tag_translation_base[1]),
+            normalize_angle(base_yaw_camera + tag_yaw),
+        )
+
+    def _calculate_robot_pose_3d(self, tag_map_pose, tag_in_base):
+        tag_in_map = make_transform(
+            rpy_to_matrix(
+                tag_map_pose["roll"],
+                tag_map_pose["pitch"],
+                tag_map_pose["yaw"],
+            ),
+            [tag_map_pose["x"], tag_map_pose["y"], tag_map_pose["z"]],
+        )
+        tag_in_base_transform = make_transform(
+            tag_in_base["rotation"],
+            tag_in_base["translation"],
+        )
+        base_in_map = tag_in_map @ np.linalg.inv(tag_in_base_transform)
+        return (
+            float(base_in_map[0, 3]),
+            float(base_in_map[1, 3]),
+            yaw_from_matrix(base_in_map[:3, :3]),
+        )
 
     def _succeed(self, tag_id):
         self._stop_robot()
@@ -314,6 +535,14 @@ class AprilLocalizer(Node):
         msg.pose.covariance[7] = self.initial_pose_covariance
         msg.pose.covariance[35] = self.initial_pose_covariance
         self.initial_pose_pub.publish(msg)
+
+    def abort_cb(self, msg):
+        if self.active_request is None:
+            return
+        self._stop_robot()
+        self.active_request = None
+        self.accepted_poses = []
+        self.get_logger().info("Localization aborted")
 
     def _stop_robot(self):
         self.cmd_vel_pub.publish(Twist())

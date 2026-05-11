@@ -52,6 +52,7 @@ class MultiGoal(Node):
         self.localization_active = False
         self.localization_request_id = None
         self.localization_context = None
+        self.mission_tag_poses = {}
 
         # ===== CAPTURE =====
         self.capture_mode = False
@@ -148,6 +149,11 @@ class MultiGoal(Node):
         self.localization_request_pub = self.create_publisher(
             String,
             '/localization/request',
+            10
+        )
+        self.localization_abort_pub = self.create_publisher(
+            String,
+            '/localization/abort',
             10
         )
         self.create_subscription(
@@ -326,6 +332,7 @@ class MultiGoal(Node):
                 self.mission = data
                 self.mission_id = data.get("missionId")
                 self.mission_run_id = data.get("runId")
+                self.mission_tag_poses = data.get("tagPoses", {})
 
                 self.status_topic = data.get("statusTopic")
                 self.progress_topic = data.get("progressTopic")
@@ -422,6 +429,8 @@ class MultiGoal(Node):
             payload["localize"]["timeout"] = float(localize["timeout"])
         if localize.get("rotationSpeed") is not None:
             payload["localize"]["rotationSpeed"] = float(localize["rotationSpeed"])
+        if self.mission_tag_poses:
+            payload["tagPoses"] = self.mission_tag_poses
 
         self.stop_robot()
         self.localization_active = True
@@ -492,6 +501,11 @@ class MultiGoal(Node):
 
     def stop_robot(self):
         self.cmd_vel_pub.publish(Twist())
+
+    def _send_localization_abort(self):
+        msg = String()
+        msg.data = json.dumps({"abort": True})
+        self.localization_abort_pub.publish(msg)
 
     def odom_cb(self, msg):
         self.odom = msg
@@ -1237,8 +1251,12 @@ class MultiGoal(Node):
         self.localization_active = False
         self.localization_request_id = None
         self.localization_context = None
+        self.mission_tag_poses = {}
         self.status_pub = None
         self.progress_pub = None
+
+        self._send_localization_abort()
+        self.stop_robot()
 
         # 3. reset state
         self.busy = False

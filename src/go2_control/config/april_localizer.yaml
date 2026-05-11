@@ -1,6 +1,7 @@
 april_localizer:
   ros__parameters:
     detections_topic: /detections
+    camera_info_topic: /camera/camera_info
     request_topic: /localization/request
     status_topic: /localization/status
     map_frame: map
@@ -11,9 +12,13 @@ april_localizer:
     rotation_speed: 0.25
     min_detections: 3
     initial_pose_covariance: 0.05
+    tag_size: 0.16
 
     # Configure known AprilTag map poses here.
     # yaw is radians; yawDegrees is also supported by the node if you prefer.
     # Example:
+    # 2D example:
     # tag_map_poses: '{"1":{"x":0.0,"y":0.0,"yaw":0.0},"2":{"x":5.0,"y":3.0,"yawDegrees":90}}'
+    # 3D Gazebo/real mounted tag example:
+    tag_map_poses: '{"0":{"x":-0.127092,"y":1.174860,"z":0.253073,"roll":3.141590,"pitch":-1.566600,"yaw":3.141590}}'
     tag_map_poses: '{}'
