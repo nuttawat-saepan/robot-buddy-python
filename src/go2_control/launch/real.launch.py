@@ -27,6 +27,11 @@ def generate_launch_description():
     pc2scan_param = os.path.expanduser(
         '~/unitree_ros2/src/go2_control/pc2scan.yaml'
     )
+    april_localizer_param = os.path.join(
+        get_package_share_directory('go2_control'),
+        'config',
+        'april_localizer.yaml'
+    )
 
     urdf_file = os.path.join(
         get_package_share_directory('go2_control'),
@@ -134,8 +139,16 @@ def generate_launch_description():
             name='main_node',
             output='screen',
             parameters=[{
-                         'sim_mode': True
+                         'sim_mode': False
                          }]
+        ),
+
+        Node(
+            package='go2_control',
+            executable='april_localizer',
+            name='april_localizer',
+            output='screen',
+            parameters=[april_localizer_param]
         ),
 
         Node(

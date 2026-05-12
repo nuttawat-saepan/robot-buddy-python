@@ -55,6 +55,11 @@ def generate_launch_description():
     pc2scan_param = os.path.expanduser(
         '~/unitree_ros2/src/go2_control/pc2scan_sim.yaml'
     )
+    april_localizer_param = os.path.join(
+        get_package_share_directory('go2_control'),
+        'config',
+        'april_localizer.yaml'
+    )
 
     # param_file_name = TURTLEBOT3_MODEL + '.yaml'
     # if ROS_DISTRO == 'humble':
@@ -181,6 +186,14 @@ def generate_launch_description():
             parameters=[{'use_sim_time': use_sim_time,
                          'sim_mode': True
                          }]
+        ),
+
+        Node(
+            package='go2_control',
+            executable='april_localizer',
+            name='april_localizer',
+            output='screen',
+            parameters=[april_localizer_param, {'use_sim_time': use_sim_time}]
         ),
 
         Node(

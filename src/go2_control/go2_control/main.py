@@ -14,6 +14,7 @@ import math
 import json
 import threading
 import time
+import uuid
 import paho.mqtt.client as mqtt
 from cv_bridge import CvBridge
 import cv2
@@ -48,6 +49,10 @@ class MultiGoal(Node):
         self.odom = None
         self.imu = None
         self.map = None
+        self.localization_active = False
+        self.localization_request_id = None
+        self.localization_context = None
+        self.mission_tag_poses = {}
 
         # ===== CAPTURE =====
         self.capture_mode = False
@@ -100,6 +105,10 @@ class MultiGoal(Node):
         self.get_logger().info("💀 MultiGoal ready")
         self.current_x = 0.0
         self.current_y = 0.0
+        self.odom = None
+        self.imu = None
+        self.map = None
+        self.last_cmd_vel = None
 
         self.bridge = CvBridge()
         self.latest_frame = None
@@ -135,6 +144,22 @@ class MultiGoal(Node):
         self.cmd_vel_pub = self.create_publisher(
             Twist,
             '/cmd_vel',
+            10
+        )
+        self.localization_request_pub = self.create_publisher(
+            String,
+            '/localization/request',
+            10
+        )
+        self.localization_abort_pub = self.create_publisher(
+            String,
+            '/localization/abort',
+            10
+        )
+        self.create_subscription(
+            String,
+            '/localization/status',
+            self.localization_status_cb,
             10
         )
         self.status_pub = None
@@ -225,7 +250,13 @@ class MultiGoal(Node):
             if topic == "/missions/control":
                 cmd = data.get("action", "")
 
-                if cmd == "pause":
+                if "localize" in data or cmd == "localize":
+                    localize = data.get("localize", {})
+                    if not isinstance(localize, dict):
+                        localize = {}
+                    self.start_localization(localize, source="manual")
+
+                elif cmd == "pause":
                     self.get_logger().warn("⏸ PAUSE")
                     self.paused = True
                     
@@ -301,6 +332,7 @@ class MultiGoal(Node):
                 self.mission = data
                 self.mission_id = data.get("missionId")
                 self.mission_run_id = data.get("runId")
+                self.mission_tag_poses = data.get("tagPoses", {})
 
                 self.status_topic = data.get("statusTopic")
                 self.progress_topic = data.get("progressTopic")
@@ -324,6 +356,7 @@ class MultiGoal(Node):
                         "y": float(wp.get("y", 0.0)),
                         "yaw": float(wp.get("yaw", 0.0)),
                         "is_capture": wp.get("isCapture", False),
+                        "localize": self.parse_localize_config(wp.get("localize")),
                         "name": wp.get("name", f"WP-{i}")
                     })
 
@@ -359,6 +392,120 @@ class MultiGoal(Node):
 
         except Exception as e:
             self.get_logger().error(f"MQTT handler error: {e}")
+
+    def parse_localize_config(self, raw):
+        if not isinstance(raw, dict):
+            return {"enabled": False}
+
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "scan": bool(raw.get("scan", False)),
+            "expectedTagId": raw.get("expectedTagId"),
+            "timeout": raw.get("timeout"),
+            "rotationSpeed": raw.get("rotationSpeed"),
+        }
+
+    def start_localization(self, localize, source="manual"):
+        if self.localization_active:
+            self.get_logger().warn("Localization already running")
+            return
+
+        request_id = str(uuid.uuid4())
+        payload = {
+            "requestId": request_id,
+            "source": source,
+            "runId": self.mission_run_id,
+            "missionId": self.mission_id,
+            "waypointIndex": self.current_index if source == "waypoint" else None,
+            "waypointName": self.current_name if source == "waypoint" else None,
+            "localize": {
+                "scan": bool(localize.get("scan", False)),
+            },
+        }
+
+        if localize.get("expectedTagId") is not None:
+            payload["localize"]["expectedTagId"] = int(localize["expectedTagId"])
+        if localize.get("timeout") is not None:
+            payload["localize"]["timeout"] = float(localize["timeout"])
+        if localize.get("rotationSpeed") is not None:
+            payload["localize"]["rotationSpeed"] = float(localize["rotationSpeed"])
+        if self.mission_tag_poses:
+            payload["tagPoses"] = self.mission_tag_poses
+
+        self.stop_robot()
+        self.localization_active = True
+        self.localization_request_id = request_id
+        self.localization_context = source
+
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.localization_request_pub.publish(msg)
+        self.publish_localization_event({
+            "requestId": request_id,
+            "source": source,
+            "status": "REQUESTED",
+            "message": "Localization requested",
+            "scan": payload["localize"]["scan"],
+        })
+
+    def localization_status_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"Localization status JSON failed: {e}")
+            return
+
+        self.publish_localization_event(data)
+
+        if not self.localization_active:
+            return
+
+        if data.get("requestId") != self.localization_request_id:
+            return
+
+        status = data.get("status")
+        if status == "SUCCESS":
+            context = self.localization_context
+            self.localization_active = False
+            self.localization_request_id = None
+            self.localization_context = None
+
+            if context == "waypoint":
+                self.publish_progress(f"Localized at {self.current_name}")
+                self.after_waypoint_localization()
+
+        elif status == "FAILED":
+            context = self.localization_context
+            message = data.get("message", "Localization failed")
+            self.localization_active = False
+            self.localization_request_id = None
+            self.localization_context = None
+
+            if context == "waypoint":
+                self.publish_status("FAILED", message)
+                self.cancel_waypoints()
+
+    def publish_localization_event(self, data):
+        payload = {
+            "runId": self.mission_run_id,
+            "missionId": self.mission_id,
+            "waypointIndex": self.current_index,
+            "waypointName": self.current_name,
+            **data,
+        }
+        try:
+            if self.mqtt.is_connected():
+                self.mqtt.publish("/missions/localization", json.dumps(payload))
+        except Exception as e:
+            self.get_logger().error(f"Publish localization event failed: {e}")
+
+    def stop_robot(self):
+        self.cmd_vel_pub.publish(Twist())
+
+    def _send_localization_abort(self):
+        msg = String()
+        msg.data = json.dumps({"abort": True})
+        self.localization_abort_pub.publish(msg)
 
     def odom_cb(self, msg):
         self.odom = msg
@@ -606,7 +753,7 @@ class MultiGoal(Node):
                     f" total = {self.total_waypoints}"
                 )
             self.get_logger().info(
-                f" progress = {progress}"
+                f" progress = {round(((self.current_index) / self.total_waypoints) * 100)}"
             )
             if not self.progress_topic:
                 return
@@ -752,7 +899,7 @@ class MultiGoal(Node):
 
     # ================= LOOP =================
     def loop(self):
-        if self.busy or self.paused or self.waiting_cancel or self.spin_running:
+        if self.busy or self.paused or self.waiting_cancel or self.spin_running or self.localization_active:
             return
 
         if len(self.pending_goal) > 0:
@@ -863,6 +1010,12 @@ class MultiGoal(Node):
             self.current_x = x
             self.current_y = y
 
+            localize = goal.get("localize", {"enabled": False})
+            if localize.get("enabled"):
+                self.publish_progress(f"Localizing at {self.current_name}")
+                self.start_localization(localize, source="waypoint")
+                return
+
             if is_capture:
                 self.get_logger().info("⏳ wait 2 sec before spin")
 
@@ -907,6 +1060,14 @@ class MultiGoal(Node):
             self.cancel_waypoints()
 
     # 🔄 start spin
+    def after_waypoint_localization(self):
+        if self.current_goal and self.current_goal.get("is_capture"):
+            self.get_logger().info("Wait 2 sec before capture spin")
+            self.capture_mode = True
+            threading.Timer(2.0, self.start_spin).start()
+        else:
+            self.finish()
+
     def start_spin(self):
         self.in_spin_mode = True
         self.get_logger().info("🔄 Start spin based on current yaw")
@@ -1087,8 +1248,15 @@ class MultiGoal(Node):
         self.mission_run_id = None
         self.in_spin_mode = False
         self.paused = False
+        self.localization_active = False
+        self.localization_request_id = None
+        self.localization_context = None
+        self.mission_tag_poses = {}
         self.status_pub = None
         self.progress_pub = None
+
+        self._send_localization_abort()
+        self.stop_robot()
 
         # 3. reset state
         self.busy = False
