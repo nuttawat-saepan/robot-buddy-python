@@ -147,18 +147,6 @@ class AprilLocalizer(Node):
             self.declare_parameter("rotation_speed", 0.25).value
         )
         self.min_detections = int(self.declare_parameter("min_detections", 3).value)
-        self.max_detection_spread = float(
-            self.declare_parameter("max_detection_spread", 0.25).value
-        )
-        self.max_detection_yaw_spread = float(
-            self.declare_parameter("max_detection_yaw_spread", math.radians(15.0)).value
-        )
-        self.max_pose_jump = float(
-            self.declare_parameter("max_pose_jump", 1.0).value
-        )
-        self.max_yaw_jump = float(
-            self.declare_parameter("max_yaw_jump", math.radians(60.0)).value
-        )
         self.initial_pose_covariance = float(
             self.declare_parameter("initial_pose_covariance", 0.05).value
         )
@@ -284,15 +272,6 @@ class AprilLocalizer(Node):
             "rotationSpeed": float(
                 localize.get("rotationSpeed", self.default_rotation_speed)
             ),
-            "force": bool(localize.get("force", False)),
-            "maxDetectionSpread": float(
-                localize.get("maxDetectionSpread", self.max_detection_spread)
-            ),
-            "maxDetectionYawSpread": float(
-                localize.get("maxDetectionYawSpread", self.max_detection_yaw_spread)
-            ),
-            "maxPoseJump": float(localize.get("maxPoseJump", self.max_pose_jump)),
-            "maxYawJump": float(localize.get("maxYawJump", self.max_yaw_jump)),
             "startedAt": time.monotonic(),
             "source": data.get("source", localize.get("source", "manual")),
         }
@@ -513,20 +492,7 @@ class AprilLocalizer(Node):
 
     def _succeed(self, tag_id):
         self._stop_robot()
-        poses = self.accepted_poses[-self.min_detections :]
-        pose = self._average_pose(poses)
-        guard = self._validate_pose_update(pose, poses)
-        if not guard["ok"]:
-            self._fail(
-                guard["message"],
-                extra={
-                    "tagId": tag_id,
-                    "pose": {"x": pose[0], "y": pose[1], "yaw": pose[2]},
-                    "guard": guard,
-                },
-            )
-            return
-
+        pose = self._average_pose(self.accepted_poses[-self.min_detections :])
         self._publish_initial_pose(pose)
         self._publish_status(
             "SUCCESS",
@@ -534,121 +500,16 @@ class AprilLocalizer(Node):
             extra={
                 "tagId": tag_id,
                 "pose": {"x": pose[0], "y": pose[1], "yaw": pose[2]},
-                "guard": guard,
             },
         )
         self.active_request = None
         self.accepted_poses = []
 
-    def _fail(self, message, extra=None):
+    def _fail(self, message):
         self._stop_robot()
-        self._publish_status("FAILED", message=message, extra=extra)
+        self._publish_status("FAILED", message=message)
         self.active_request = None
         self.accepted_poses = []
-
-    def _validate_pose_update(self, pose, poses):
-        request = self.active_request or {}
-        force = bool(request.get("force", False))
-        spread = self._pose_spread(poses)
-        jump = self._pose_jump_from_current(pose)
-
-        guard = {
-            "ok": True,
-            "force": force,
-            "spread": spread,
-            "jump": jump,
-            "limits": {
-                "maxDetectionSpread": request.get(
-                    "maxDetectionSpread", self.max_detection_spread
-                ),
-                "maxDetectionYawSpread": request.get(
-                    "maxDetectionYawSpread", self.max_detection_yaw_spread
-                ),
-                "maxPoseJump": request.get("maxPoseJump", self.max_pose_jump),
-                "maxYawJump": request.get("maxYawJump", self.max_yaw_jump),
-            },
-        }
-
-        if force:
-            return guard
-
-        if spread["distance"] > guard["limits"]["maxDetectionSpread"]:
-            guard["ok"] = False
-            guard["message"] = (
-                f"AprilTag pose detections are not stable: "
-                f"spread={spread['distance']:.3f}m"
-            )
-            return guard
-
-        if spread["yaw"] > guard["limits"]["maxDetectionYawSpread"]:
-            guard["ok"] = False
-            guard["message"] = (
-                f"AprilTag pose yaw is not stable: "
-                f"spread={math.degrees(spread['yaw']):.1f}deg"
-            )
-            return guard
-
-        if jump is None:
-            return guard
-
-        if jump["distance"] > guard["limits"]["maxPoseJump"]:
-            guard["ok"] = False
-            guard["message"] = (
-                f"AprilTag pose jump rejected: jump={jump['distance']:.3f}m"
-            )
-            return guard
-
-        if abs(jump["yaw"]) > guard["limits"]["maxYawJump"]:
-            guard["ok"] = False
-            guard["message"] = (
-                f"AprilTag yaw jump rejected: "
-                f"jump={math.degrees(abs(jump['yaw'])):.1f}deg"
-            )
-            return guard
-
-        return guard
-
-    def _pose_spread(self, poses):
-        center = self._average_pose(poses)
-        max_distance = 0.0
-        max_yaw = 0.0
-        for candidate in poses:
-            max_distance = max(
-                max_distance,
-                math.hypot(candidate[0] - center[0], candidate[1] - center[1]),
-            )
-            max_yaw = max(
-                max_yaw,
-                abs(normalize_angle(candidate[2] - center[2])),
-            )
-        return {"distance": max_distance, "yaw": max_yaw}
-
-    def _pose_jump_from_current(self, pose):
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.2),
-            )
-        except Exception as e:
-            self.get_logger().warn(f"TF {self.map_frame}<-{self.base_frame} failed for jump guard: {e}")
-            return None
-
-        q = tf.transform.rotation
-        current_yaw = math.atan2(
-            2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-        )
-        dx = pose[0] - tf.transform.translation.x
-        dy = pose[1] - tf.transform.translation.y
-        dyaw = normalize_angle(pose[2] - current_yaw)
-        return {
-            "distance": math.hypot(dx, dy),
-            "dx": dx,
-            "dy": dy,
-            "yaw": dyaw,
-        }
 
     def _average_pose(self, poses):
         x = sum(p[0] for p in poses) / len(poses)

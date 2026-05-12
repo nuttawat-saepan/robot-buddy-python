@@ -46,6 +46,7 @@ class RobotRead(Node):
         self._odom_msg = Odometry()
         
 
+
         self._tf_msg = TransformStamped()
         self._battery_msg = BatteryState()
         self._battery_msg.header.frame_id = 'base_link'

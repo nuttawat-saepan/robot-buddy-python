@@ -65,6 +65,7 @@ class MultiGoal(Node):
         self.pose_adjust_timer = None
         self.pose_correction_active = False
         self.pose_correction_completed = False
+        self.pose_adjust_state = None
 
         # ===== CAPTURE =====
         self.capture_mode = False
@@ -510,6 +511,8 @@ class MultiGoal(Node):
         status = data.get("status")
         if status == "SUCCESS":
             context = self.localization_context
+            if context == "waypoint" and self.pose_adjust_state is not None:
+                self.pose_adjust_state["localizationResult"] = data
             self.localization_active = False
             self.localization_request_id = None
             self.localization_context = None
@@ -521,9 +524,19 @@ class MultiGoal(Node):
         elif status == "FAILED":
             context = self.localization_context
             message = data.get("message", "Localization failed")
+            if context == "waypoint":
+                self.publish_pose_adjust_event({
+                    "eventType": "POSE_ADJUST_FAILED",
+                    "requestId": data.get("requestId"),
+                    "result": "LOCALIZATION_FAILED",
+                    "message": message,
+                    "localization": data,
+                    "state": self.pose_adjust_state,
+                })
             self.localization_active = False
             self.localization_request_id = None
             self.localization_context = None
+            self.pose_adjust_state = None
 
             if context == "waypoint":
                 self.publish_status("FAILED", message)
@@ -543,10 +556,24 @@ class MultiGoal(Node):
         except Exception as e:
             self.get_logger().error(f"Publish localization event failed: {e}")
 
+    def publish_pose_adjust_event(self, data):
+        payload = {
+            "runId": self.mission_run_id,
+            "missionId": self.mission_id,
+            "waypointIndex": self.current_index,
+            "waypointName": self.current_name,
+            **data,
+        }
+        try:
+            if self.mqtt.is_connected():
+                self.mqtt.publish("/missions/pose-adjust", json.dumps(payload))
+        except Exception as e:
+            self.get_logger().error(f"Publish pose adjust event failed: {e}")
+
     def stop_robot(self):
         self.cmd_vel_pub.publish(Twist())
 
-    def get_current_pose(self):
+    def get_current_pose(self, warn=True):
         try:
             trans = self.tf_buffer.lookup_transform(
                 "map",
@@ -566,7 +593,47 @@ class MultiGoal(Node):
             )
 
         except Exception as e:
-            self.get_logger().warn(f"TF pose failed: {e}")
+            if warn:
+                self.get_logger().warn(f"TF pose failed: {e}")
+            return None
+
+    def pose_to_dict(self, pose, source):
+        if pose is None:
+            return None
+
+        return {
+            "x": pose[0],
+            "y": pose[1],
+            "yaw": pose[2],
+            "source": source,
+        }
+
+    def build_pose_delta(self, start_pose, end_pose):
+        if start_pose is None or end_pose is None:
+            return None
+
+        dx = end_pose[0] - start_pose[0]
+        dy = end_pose[1] - start_pose[1]
+        dyaw = self.angle_error(end_pose[2], start_pose[2])
+        return {
+            "dx": dx,
+            "dy": dy,
+            "distance": math.hypot(dx, dy),
+            "dyaw": dyaw,
+            "dyawDegrees": math.degrees(dyaw),
+        }
+
+    def pose_dict_to_tuple(self, pose):
+        if not isinstance(pose, dict):
+            return None
+
+        try:
+            return (
+                float(pose.get("x", 0.0)),
+                float(pose.get("y", 0.0)),
+                float(pose.get("yaw", 0.0)),
+            )
+        except Exception:
             return None
 
     def _send_localization_abort(self):
@@ -670,6 +737,7 @@ class MultiGoal(Node):
 
             # ================= ODOM =================
             if self.odom is not None:
+                map_pose = self.get_current_pose(warn=False)
 
                 odom_data = {
                     "px": self.odom.pose.pose.position.x,
@@ -689,6 +757,35 @@ class MultiGoal(Node):
                     "wy": self.odom.twist.twist.angular.y,
                     "wz": self.odom.twist.twist.angular.z
                 }
+
+                if map_pose is not None:
+                    q = self.yaw_to_q(map_pose[2])
+                    odom_data.update({
+                        "frame_id": "map",
+                        "pose_source": "map_tf",
+                        "px": map_pose[0],
+                        "py": map_pose[1],
+                        "pz": 0.0,
+                        "qx": q.x,
+                        "qy": q.y,
+                        "qz": q.z,
+                        "qw": q.w,
+                        "yaw": map_pose[2],
+                        "raw_odom": {
+                            "px": self.odom.pose.pose.position.x,
+                            "py": self.odom.pose.pose.position.y,
+                            "pz": self.odom.pose.pose.position.z,
+                            "qx": self.odom.pose.pose.orientation.x,
+                            "qy": self.odom.pose.pose.orientation.y,
+                            "qz": self.odom.pose.pose.orientation.z,
+                            "qw": self.odom.pose.pose.orientation.w,
+                        }
+                    })
+                else:
+                    odom_data.update({
+                        "frame_id": "odom",
+                        "pose_source": "odom",
+                    })
 
                 self.mqtt.publish(
                     "odom",
@@ -1081,6 +1178,15 @@ class MultiGoal(Node):
             if self.pose_correction_active:
                 self.pose_correction_active = False
                 self.publish_progress(f"Position corrected at {self.current_name}")
+                corrected_pose = self.get_current_pose(warn=False)
+                self.publish_pose_adjust_event({
+                    "eventType": "POSE_CORRECTION_COMPLETED",
+                    "requestId": self.pose_adjust_state.get("requestId") if self.pose_adjust_state else None,
+                    "result": "CORRECTION_REACHED",
+                    "correctedPose": self.pose_to_dict(corrected_pose, "map_tf"),
+                    "state": self.pose_adjust_state,
+                })
+                self.pose_adjust_state = None
                 if is_capture:
                     self.get_logger().info("Wait 2 sec before capture spin")
                     self.capture_mode = True
@@ -1111,6 +1217,16 @@ class MultiGoal(Node):
                 self.get_logger().info("⏸ Paused, waiting for resume")
                 self.busy = False
                 return
+            if self.pose_correction_active:
+                self.publish_pose_adjust_event({
+                    "eventType": "POSE_CORRECTION_FAILED",
+                    "requestId": self.pose_adjust_state.get("requestId") if self.pose_adjust_state else None,
+                    "result": "CORRECTION_ABORTED",
+                    "goalStatus": "ABORTED",
+                    "state": self.pose_adjust_state,
+                })
+                self.pose_adjust_state = None
+                self.pose_correction_active = False
             self.publish_status("FAILED", "Map change or path blocked")
             # fallback logic (สำคัญ)
             self.cancel_waypoints()
@@ -1128,6 +1244,16 @@ class MultiGoal(Node):
                 self.stop_requested = False
             else:
                 self.get_logger().warn(f"💥 ABORTED at goal: {self.current_goal}")
+                if self.pose_correction_active:
+                    self.publish_pose_adjust_event({
+                        "eventType": "POSE_CORRECTION_FAILED",
+                        "requestId": self.pose_adjust_state.get("requestId") if self.pose_adjust_state else None,
+                        "result": "CORRECTION_CANCELED",
+                        "goalStatus": "CANCELED",
+                        "state": self.pose_adjust_state,
+                    })
+                    self.pose_adjust_state = None
+                    self.pose_correction_active = False
                 self.publish_status("FAILED", "Map change or path blocked")
             self.cancel_waypoints()
 
@@ -1143,6 +1269,25 @@ class MultiGoal(Node):
         self.stop_robot()
         self.publish_progress(f"Stopping before pose adjust at {self.current_name}")
 
+        before_pose = self.get_current_pose(warn=False)
+        self.pose_adjust_state = {
+            "targetWaypoint": {
+                "x": float(self.current_goal["x"]),
+                "y": float(self.current_goal["y"]),
+                "yaw": float(self.current_goal["yaw"]),
+            } if self.current_goal else None,
+            "beforePose": self.pose_to_dict(before_pose, "map_tf"),
+            "localizeConfig": dict(localize),
+            "startedAt": time.time(),
+        }
+        self.publish_pose_adjust_event({
+            "eventType": "POSE_ADJUST_STARTED",
+            "result": "PENDING",
+            "beforePose": self.pose_adjust_state["beforePose"],
+            "targetWaypoint": self.pose_adjust_state["targetWaypoint"],
+            "localizeConfig": self.pose_adjust_state["localizeConfig"],
+        })
+
         delay = max(0.0, float(localize.get("stopDelay", 1.0)))
 
         def start_after_stop():
@@ -1150,6 +1295,8 @@ class MultiGoal(Node):
                 return
             self.publish_progress(f"Adjusting pose at {self.current_name}")
             self.start_localization(localize, source="waypoint")
+            if self.pose_adjust_state is not None:
+                self.pose_adjust_state["requestId"] = self.localization_request_id
 
         self.pose_adjust_timer = threading.Timer(delay, start_after_stop)
         self.pose_adjust_timer.start()
@@ -1204,6 +1351,12 @@ class MultiGoal(Node):
         self.pose_correction_completed = True
         self.stop_robot()
         self.publish_progress(f"Correcting position at {self.current_name}")
+        self.publish_pose_adjust_event({
+            "eventType": "POSE_CORRECTION_STARTED",
+            "requestId": self.pose_adjust_state.get("requestId") if self.pose_adjust_state else None,
+            "result": "CORRECTION_NEEDED",
+            "state": self.pose_adjust_state,
+        })
         self.send_goal(self.current_goal)
 
     def after_waypoint_localization(self):
@@ -1211,15 +1364,46 @@ class MultiGoal(Node):
         self.pose_adjust_timer = None
 
         pose = self.get_current_pose()
+        state = self.pose_adjust_state or {}
+        before_pose = self.pose_dict_to_tuple(state.get("beforePose"))
+        localized_pose = None
+        localization_result = state.get("localizationResult")
+        if isinstance(localization_result, dict):
+            raw_pose = localization_result.get("pose")
+            if isinstance(raw_pose, dict):
+                try:
+                    localized_pose = (
+                        float(raw_pose.get("x", 0.0)),
+                        float(raw_pose.get("y", 0.0)),
+                        float(raw_pose.get("yaw", 0.0)),
+                    )
+                except Exception:
+                    localized_pose = None
+
         if pose is not None:
             self.current_x = pose[0]
             self.current_y = pose[1]
             self.get_logger().info(
                 f"Pose adjusted to x={pose[0]:.3f}, y={pose[1]:.3f}, yaw={math.degrees(pose[2]):.1f} deg"
             )
-            if self.needs_position_correction(pose):
+            correction_needed = self.needs_position_correction(pose)
+            self.publish_pose_adjust_event({
+                "eventType": "POSE_ADJUST_SETTLED",
+                "requestId": state.get("requestId"),
+                "result": "CORRECTION_NEEDED" if correction_needed else "ADJUSTED_NO_CORRECTION",
+                "beforePose": state.get("beforePose"),
+                "localizedPose": self.pose_to_dict(localized_pose, "apriltag"),
+                "afterSettlePose": self.pose_to_dict(pose, "map_tf"),
+                "deltaFromBefore": self.build_pose_delta(before_pose, pose),
+                "deltaFromLocalized": self.build_pose_delta(localized_pose, pose),
+                "targetWaypoint": state.get("targetWaypoint"),
+                "localizeConfig": state.get("localizeConfig"),
+                "correctionNeeded": correction_needed,
+            })
+            if correction_needed:
                 self.start_position_correction()
                 return
+            self.pose_adjust_state = None
 
         if self.current_goal and self.current_goal.get("is_capture"):
             self.get_logger().info("Wait 2 sec before capture spin")
@@ -1417,6 +1601,7 @@ class MultiGoal(Node):
         self.pose_adjust_timer = None
         self.pose_correction_active = False
         self.pose_correction_completed = False
+        self.pose_adjust_state = None
         self.mission_tag_poses = {}
         self.status_pub = None
         self.progress_pub = None

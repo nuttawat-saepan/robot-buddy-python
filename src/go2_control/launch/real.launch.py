@@ -126,11 +126,16 @@ def generate_launch_description():
         ),
 
         Node(
-            package = 'go2_control',
-            executable = 'camera',
-            name='camera',
-            arguments=['wlp4s0'],  # 👈 เปลี่ยนตาม interface จริง
-            output='screen'
+            package='go2_control',
+            executable='Stream',
+            name='Stream',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'sim_mode': False,
+                'camera_interface': 'wlp4s0',
+                'output_topic': '/frontvideostream'
+            }]
         ),
 
         Node(

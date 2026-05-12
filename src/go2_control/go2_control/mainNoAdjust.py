@@ -27,14 +27,6 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import Imu
 
 
-def normalize_degrees(angle):
-    while angle > 180.0:
-        angle -= 360.0
-    while angle <= -180.0:
-        angle += 360.0
-    return angle
-
-
 class MultiGoal(Node):
     def __init__(self):
         super().__init__('multi_goal')
@@ -61,10 +53,6 @@ class MultiGoal(Node):
         self.localization_request_id = None
         self.localization_context = None
         self.mission_tag_poses = {}
-        self.pose_adjust_active = False
-        self.pose_adjust_timer = None
-        self.pose_correction_active = False
-        self.pose_correction_completed = False
 
         # ===== CAPTURE =====
         self.capture_mode = False
@@ -266,8 +254,6 @@ class MultiGoal(Node):
                     localize = data.get("localize", {})
                     if not isinstance(localize, dict):
                         localize = {}
-                    if "tagPoses" in data and data["tagPoses"]:
-                        self.mission_tag_poses = data["tagPoses"]
                     self.start_localization(localize, source="manual")
 
                 elif cmd == "pause":
@@ -347,12 +333,6 @@ class MultiGoal(Node):
                 self.mission_id = data.get("missionId")
                 self.mission_run_id = data.get("runId")
                 self.mission_tag_poses = data.get("tagPoses", {})
-                if self.mission_tag_poses:
-                    self.get_logger().info(
-                        f"[tagPoses] received ids={list(self.mission_tag_poses.keys())}"
-                    )
-                else:
-                    self.get_logger().warn("[tagPoses] not in mission payload → april_localizer will use YAML fallback")
 
                 self.status_topic = data.get("statusTopic")
                 self.progress_topic = data.get("progressTopic")
@@ -423,26 +403,7 @@ class MultiGoal(Node):
             "expectedTagId": raw.get("expectedTagId"),
             "timeout": raw.get("timeout"),
             "rotationSpeed": raw.get("rotationSpeed"),
-            "stopDelay": float(raw.get("stopDelay") or 1.0),
-            "settleTime": float(raw.get("settleTime") or 2.0),
-            "correctPosition": bool(raw.get("correctPosition", True)),
-            "positionTolerance": float(raw.get("positionTolerance") or 0.15),
-            "yawTolerance": float(raw.get("yawTolerance") or 0.15),
         }
-
-    def normalize_tag_poses_for_robot(self, tag_poses):
-        normalized = {}
-        for tag_id, pose in tag_poses.items():
-            if not isinstance(pose, dict):
-                normalized[tag_id] = pose
-                continue
-
-            robot_pose = dict(pose)
-            if "yawDegrees" in robot_pose:
-                frontend_yaw = float(robot_pose["yawDegrees"])
-                robot_pose["yawDegrees"] = normalize_degrees(frontend_yaw - 255.0)
-            normalized[tag_id] = robot_pose
-        return normalized
 
     def start_localization(self, localize, source="manual"):
         if self.localization_active:
@@ -469,12 +430,7 @@ class MultiGoal(Node):
         if localize.get("rotationSpeed") is not None:
             payload["localize"]["rotationSpeed"] = float(localize["rotationSpeed"])
         if self.mission_tag_poses:
-            payload["tagPoses"] = self.normalize_tag_poses_for_robot(self.mission_tag_poses)
-            self.get_logger().info(
-                f"[tagPoses] forwarding to april_localizer ids={list(self.mission_tag_poses.keys())}"
-            )
-        else:
-            self.get_logger().warn("[tagPoses] empty → april_localizer will use YAML fallback")
+            payload["tagPoses"] = self.mission_tag_poses
 
         self.stop_robot()
         self.localization_active = True
@@ -516,7 +472,7 @@ class MultiGoal(Node):
 
             if context == "waypoint":
                 self.publish_progress(f"Localized at {self.current_name}")
-                self.settle_after_pose_adjust()
+                self.after_waypoint_localization()
 
         elif status == "FAILED":
             context = self.localization_context
@@ -545,29 +501,6 @@ class MultiGoal(Node):
 
     def stop_robot(self):
         self.cmd_vel_pub.publish(Twist())
-
-    def get_current_pose(self):
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                "map",
-                "base_link",
-                rclpy.time.Time()
-            )
-
-            q = trans.transform.rotation
-            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            yaw = math.atan2(siny_cosp, cosy_cosp)
-
-            return (
-                trans.transform.translation.x,
-                trans.transform.translation.y,
-                yaw,
-            )
-
-        except Exception as e:
-            self.get_logger().warn(f"TF pose failed: {e}")
-            return None
 
     def _send_localization_abort(self):
         msg = String()
@@ -983,7 +916,6 @@ class MultiGoal(Node):
         self.current_goal = self.pending_goal.pop(0)
         goal = self.current_goal
         self.current_name = goal["name"]
-        self.pose_correction_completed = False
         if self.current_goal is None:
             self.get_logger().error("current_goal is None WTF")
             return
@@ -1078,20 +1010,10 @@ class MultiGoal(Node):
             self.current_x = x
             self.current_y = y
 
-            if self.pose_correction_active:
-                self.pose_correction_active = False
-                self.publish_progress(f"Position corrected at {self.current_name}")
-                if is_capture:
-                    self.get_logger().info("Wait 2 sec before capture spin")
-                    self.capture_mode = True
-                    threading.Timer(2.0, self.start_spin).start()
-                else:
-                    self.finish()
-                return
-
             localize = goal.get("localize", {"enabled": False})
             if localize.get("enabled"):
-                self.begin_waypoint_pose_adjust(localize)
+                self.publish_progress(f"Localizing at {self.current_name}")
+                self.start_localization(localize, source="waypoint")
                 return
 
             if is_capture:
@@ -1138,89 +1060,7 @@ class MultiGoal(Node):
             self.cancel_waypoints()
 
     # 🔄 start spin
-    def begin_waypoint_pose_adjust(self, localize):
-        self.pose_adjust_active = True
-        self.stop_robot()
-        self.publish_progress(f"Stopping before pose adjust at {self.current_name}")
-
-        delay = max(0.0, float(localize.get("stopDelay", 1.0)))
-
-        def start_after_stop():
-            if not self.pose_adjust_active or self.current_goal is None:
-                return
-            self.publish_progress(f"Adjusting pose at {self.current_name}")
-            self.start_localization(localize, source="waypoint")
-
-        self.pose_adjust_timer = threading.Timer(delay, start_after_stop)
-        self.pose_adjust_timer.start()
-
-    def settle_after_pose_adjust(self):
-        if not self.current_goal:
-            return
-
-        self.stop_robot()
-        self.publish_progress(f"Pose adjusted, waiting to settle at {self.current_name}")
-
-        localize = self.current_goal.get("localize", {"enabled": False})
-        settle_time = max(0.0, float(localize.get("settleTime", 2.0)))
-
-        self.pose_adjust_timer = threading.Timer(settle_time, self.after_waypoint_localization)
-        self.pose_adjust_timer.start()
-
-    def angle_error(self, target, current):
-        return math.atan2(math.sin(target - current), math.cos(target - current))
-
-    def needs_position_correction(self, pose):
-        if not self.current_goal:
-            return False
-
-        localize = self.current_goal.get("localize", {"enabled": False})
-        if not localize.get("correctPosition", True):
-            return False
-        if self.pose_correction_completed:
-            return False
-
-        target_x = float(self.current_goal["x"])
-        target_y = float(self.current_goal["y"])
-        target_yaw = float(self.current_goal["yaw"])
-
-        position_error = math.hypot(target_x - pose[0], target_y - pose[1])
-        yaw_error = abs(self.angle_error(target_yaw, pose[2]))
-        position_tolerance = max(0.0, float(localize.get("positionTolerance", 0.15)))
-        yaw_tolerance = max(0.0, float(localize.get("yawTolerance", 0.15)))
-
-        self.get_logger().info(
-            f"Pose correction check: position_error={position_error:.3f}m, "
-            f"yaw_error={math.degrees(yaw_error):.1f}deg"
-        )
-
-        return position_error > position_tolerance or yaw_error > yaw_tolerance
-
-    def start_position_correction(self):
-        if not self.current_goal:
-            return
-
-        self.pose_correction_active = True
-        self.pose_correction_completed = True
-        self.stop_robot()
-        self.publish_progress(f"Correcting position at {self.current_name}")
-        self.send_goal(self.current_goal)
-
     def after_waypoint_localization(self):
-        self.pose_adjust_active = False
-        self.pose_adjust_timer = None
-
-        pose = self.get_current_pose()
-        if pose is not None:
-            self.current_x = pose[0]
-            self.current_y = pose[1]
-            self.get_logger().info(
-                f"Pose adjusted to x={pose[0]:.3f}, y={pose[1]:.3f}, yaw={math.degrees(pose[2]):.1f} deg"
-            )
-            if self.needs_position_correction(pose):
-                self.start_position_correction()
-                return
-
         if self.current_goal and self.current_goal.get("is_capture"):
             self.get_logger().info("Wait 2 sec before capture spin")
             self.capture_mode = True
@@ -1411,12 +1251,6 @@ class MultiGoal(Node):
         self.localization_active = False
         self.localization_request_id = None
         self.localization_context = None
-        self.pose_adjust_active = False
-        if self.pose_adjust_timer is not None:
-            self.pose_adjust_timer.cancel()
-        self.pose_adjust_timer = None
-        self.pose_correction_active = False
-        self.pose_correction_completed = False
         self.mission_tag_poses = {}
         self.status_pub = None
         self.progress_pub = None

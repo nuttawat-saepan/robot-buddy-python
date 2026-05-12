@@ -196,6 +196,23 @@ def generate_launch_description():
             parameters=[april_localizer_param, {'use_sim_time': use_sim_time}]
         ),
 
+        # Node(
+        #     package='apriltag_ros',
+        #     executable='apriltag_node',
+        #     name='apriltag_node',
+        #     output='screen',
+        #     remappings=[
+        #         ('image_rect', '/camera/image_raw'),
+        #         ('camera_info', '/camera/camera_info'),
+        #         ('detections', '/detections'),
+        #     ],
+        #     parameters=[{
+        #         'family': '36h11',
+        #         'use_sim_time': use_sim_time,
+        #           'tag_sizes': [0.16], 
+        #     }]
+        # ),
+
         Node(
             package='go2_control',
             executable='Stream',
